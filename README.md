@@ -94,5 +94,12 @@ curl -JO "http://localhost:5273/download/{documentId}?type=InvoiceCsv&version=v1
   -H "X-Api-Key: demo-key-123"
 ```
 
+**Check Status:** Monitor processing progress:
+```bash
+curl -s "http://localhost:5273/status/{documentId}" \
+  -H "X-Api-Key: demo-key-123" | jq .
+```
+
+
 > **Requires**: `jq` (`brew install jq` on macOS)
 
