@@ -23,6 +23,9 @@ public static class ServiceCollectionExtensions
 
         services.AddScoped<IWorkflowStep, PdfTextExtractStep>();
 
+        // Read Stores
+        services.AddScoped<IStatusReadStore, Persistence.StatusReadStore>();
+        
         return services;
     }
 }
