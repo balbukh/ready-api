@@ -43,7 +43,20 @@ public class CustomWebApplicationFactory : WebApplicationFactory<Program>
                 
                 // Reset DB
                 db.Database.EnsureDeleted();
-                db.Database.EnsureCreated();
+                try 
+                {
+                    // Use Migrate to ensure __EFMigrationsHistory is created
+                    db.Database.Migrate();
+                }
+                catch (Exception ex)
+                {
+                    // If migration fails here fallback or log.
+                    // But usually Migrate is what we want.
+                    // If migrations are missing in tests assembly, we might have issues.
+                    // But Ready.Infrastructure has migrations.
+                    Console.WriteLine($"Migration failed: {ex.Message}");
+                    throw;
+                }
                 
                 // Seed if needed (Program.cs seeding might run too, but let's be sure)
                 if (!db.ApiKeys.Any(k => k.Key == "demo-key-123"))
