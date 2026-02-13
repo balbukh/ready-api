@@ -8,7 +8,7 @@ using Microsoft.Extensions.Logging;
 
 namespace Ready.Application.Steps;
 
-public sealed class InvoiceExtractV1Step : IWorkflowStep
+public sealed partial class InvoiceExtractV1Step : IWorkflowStep
 {
     private readonly IOpenAiClient _ai;
     private readonly IResultStore _results;
@@ -57,6 +57,9 @@ public sealed class InvoiceExtractV1Step : IWorkflowStep
         Input text:
         """;
 
+    [GeneratedRegex(@"^[A-Z]{3}$")]
+    private static partial Regex CurrencyRegex();
+
     public InvoiceExtractV1Step(IOpenAiClient ai, IResultStore results, ILogger<InvoiceExtractV1Step> logger)
     {
         _ai = ai;
@@ -71,7 +74,8 @@ public sealed class InvoiceExtractV1Step : IWorkflowStep
 
         if (string.IsNullOrWhiteSpace(text))
         {
-            _logger.LogWarning("DocText payload is empty for run {RunId}. Returning failed.", context.RunId);
+            _logger.LogWarning("DocText payload is empty for run {RunId} doc {DocumentId}",
+                context.RunId, context.DocumentId);
             return StepOutcome.Failed("No document text available for extraction.");
         }
 
@@ -82,37 +86,158 @@ public sealed class InvoiceExtractV1Step : IWorkflowStep
         string rawResponse;
         try
         {
-            rawResponse = await _ai.GenerateJsonAsync(SystemPrompt, userPrompt, ct);
+            rawResponse = await _ai.GenerateJsonAsync(SystemPrompt, userPrompt, context.RunId, context.DocumentId, context.CorrelationId, ct);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "OpenAI call failed for run {RunId}", context.RunId);
+            _logger.LogError(ex, "OpenAI call failed for run {RunId} doc {DocumentId} corr {CorrelationId}",
+                context.RunId, context.DocumentId, context.CorrelationId);
             return StepOutcome.Failed($"OpenAI failure: {ex.Message}");
         }
 
-        // 4. JSON hygiene — strip ```json fences if present
+        // 4. JSON hygiene — strip whitespace + code fences
         string cleanJson = StripCodeFences(rawResponse);
 
-        // 5. Validate JSON parse
+        // 5. Parse JSON
         JsonNode? data;
         try
         {
+            using var doc = JsonDocument.Parse(cleanJson);
             data = JsonNode.Parse(cleanJson);
             if (data is null)
-                return StepOutcome.Failed("AI returned empty JSON.");
+            {
+                await PersistErrorAsync(context, "InvalidJson", rawResponse, errors: null, ct);
+                return StepOutcome.Failed("invalid json from model");
+            }
         }
         catch (JsonException ex)
         {
-            _logger.LogWarning(ex, "Invalid JSON from AI for run {RunId}: {Raw}", context.RunId, cleanJson);
-            return StepOutcome.Failed($"Invalid JSON from AI: {ex.Message}");
+            _logger.LogWarning(ex,
+                "Invalid JSON from model for run {RunId} doc {DocumentId} corr {CorrelationId}: {Raw}",
+                context.RunId, context.DocumentId, context.CorrelationId, cleanJson);
+
+            await PersistErrorAsync(context, "InvalidJson", rawResponse, errors: null, ct);
+            return StepOutcome.Failed("invalid json from model");
         }
 
-        // 6. Re-serialize as compact JSON for storage
-        string compactJson = data.ToJsonString(new JsonSerializerOptions { WriteIndented = false });
+        // 6. Validate required fields
+        var errors = ValidateFields(data);
+        if (errors.Count > 0)
+        {
+            _logger.LogWarning(
+                "Validation failed for run {RunId} doc {DocumentId} corr {CorrelationId}: {Errors}",
+                context.RunId, context.DocumentId, context.CorrelationId,
+                string.Join("; ", errors));
 
-        // 7. Wrap in ResultEnvelope
+            await PersistErrorAsync(context, "ValidationFailed", data.ToJsonString(), errors, ct);
+            return StepOutcome.Failed($"validation failed: {string.Join(", ", errors)}");
+        }
+
+        // 7. Re-serialize as compact JSON and persist
+        string compactJson = data.ToJsonString(new JsonSerializerOptions { WriteIndented = false });
         var result = new ResultEnvelope("InvoiceExtract", "v1", JsonNode.Parse(compactJson)!);
         return StepOutcome.Succeeded(result: result);
+    }
+
+    // ─── Validation ─────────────────────────────────────────────────────
+
+    private static List<string> ValidateFields(JsonNode data)
+    {
+        var errors = new List<string>();
+
+        // total must exist and be a number > 0
+        var totalNode = data["total"];
+        if (totalNode is null || totalNode.GetValueKind() == JsonValueKind.Null)
+            errors.Add("total is missing");
+        else if (!TryGetDouble(totalNode, out var totalVal) || totalVal <= 0)
+            errors.Add("total must be a number > 0");
+
+        // currency must exist and be 3-letter uppercase A-Z
+        var currencyNode = data["currency"];
+        if (currencyNode is null || currencyNode.GetValueKind() == JsonValueKind.Null)
+            errors.Add("currency is missing");
+        else
+        {
+            var currStr = currencyNode.ToString();
+            if (!CurrencyRegex().IsMatch(currStr))
+                errors.Add($"currency must be 3-letter uppercase (got '{currStr}')");
+        }
+
+        // Identity: invoiceNumber non-empty OR (invoiceDate non-empty AND sellerName non-empty)
+        bool hasInvoiceNumber = IsNonEmptyString(data["invoiceNumber"]);
+        bool hasInvoiceDate = IsNonEmptyString(data["invoiceDate"]);
+        bool hasSellerName = IsNonEmptyString(data["sellerName"]);
+
+        if (!hasInvoiceNumber && !(hasInvoiceDate && hasSellerName))
+            errors.Add("must have invoiceNumber, or both invoiceDate and sellerName");
+
+        // lineItems if present must be an array
+        var lineItemsNode = data["lineItems"];
+        if (lineItemsNode is not null
+            && lineItemsNode.GetValueKind() != JsonValueKind.Null
+            && lineItemsNode is not JsonArray)
+        {
+            errors.Add("lineItems must be an array");
+        }
+
+        return errors;
+    }
+
+    private static bool IsNonEmptyString(JsonNode? node)
+    {
+        if (node is null || node.GetValueKind() == JsonValueKind.Null)
+            return false;
+        return !string.IsNullOrWhiteSpace(node.ToString());
+    }
+
+    private static bool TryGetDouble(JsonNode node, out double value)
+    {
+        value = 0;
+        try
+        {
+            value = node.GetValue<double>();
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    // ─── Error persistence ──────────────────────────────────────────────
+
+    private async Task PersistErrorAsync(
+        StepContext context,
+        string reason,
+        string raw,
+        List<string>? errors,
+        CancellationToken ct)
+    {
+        try
+        {
+            var payload = new Dictionary<string, object?>
+            {
+                ["reason"] = reason,
+                ["raw"] = raw,
+                ["documentId"] = context.DocumentId.ToString(),
+                ["runId"] = context.RunId.ToString(),
+                ["step"] = Name,
+            };
+            if (errors is not null)
+                payload["errors"] = errors;
+
+            await _results.SaveAsync(context.RunId, "InvoiceExtractError", "v1", payload, ct);
+
+            _logger.LogInformation(
+                "Persisted InvoiceExtractError for run {RunId} doc {DocumentId} reason={Reason}",
+                context.RunId, context.DocumentId, reason);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "Failed to persist InvoiceExtractError for run {RunId} doc {DocumentId}",
+                context.RunId, context.DocumentId);
+        }
     }
 
     // ─── Helpers ─────────────────────────────────────────────────────────
@@ -149,8 +274,10 @@ public sealed class InvoiceExtractV1Step : IWorkflowStep
         if (string.IsNullOrWhiteSpace(raw))
             return raw;
 
-        // Remove leading ```json (or ```) and trailing ```
+        // Strip leading/trailing whitespace
         var trimmed = raw.Trim();
+
+        // Remove leading ```json (or ```) and trailing ```
         trimmed = Regex.Replace(trimmed, @"^```(?:json)?\s*\n?", "", RegexOptions.IgnoreCase);
         trimmed = Regex.Replace(trimmed, @"\n?```\s*$", "");
         return trimmed.Trim();

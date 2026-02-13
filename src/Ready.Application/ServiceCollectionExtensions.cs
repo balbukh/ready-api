@@ -21,6 +21,7 @@ public static class ServiceCollectionExtensions
         {
             var options = sp.GetRequiredService<IOptions<OpenAiOptions>>().Value;
             client.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", options.ApiKey);
+            client.Timeout = TimeSpan.FromSeconds(90);
         });
 
         // Workflows (поки in-memory)
@@ -30,7 +31,7 @@ public static class ServiceCollectionExtensions
                 new WorkflowDefinition(
                     Name: "invoice",
                     Version: "v1",
-                    Steps: new[] { "pdf.text.extract", "invoice.extract.v1" }
+                    Steps: new[] { "pdf.text.extract", "invoice.extract.v1", "invoice.export.csv.v1" }
                 ),
                  // Fallback for "echo" test
                 new WorkflowDefinition("echo", "v1", new[] { "echo" })
@@ -40,6 +41,7 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<Abstractions.IWorkflowStep, EchoStep>();
 
         services.AddScoped<Abstractions.IWorkflowStep, InvoiceExtractV1Step>();
+        services.AddScoped<Abstractions.IWorkflowStep, InvoiceExportCsvV1Step>();
         services.AddSingleton<Abstractions.IWorkflowStep, InvoiceValidateStep>();
         services.AddSingleton<Abstractions.IWorkflowStep, ExportJsonStep>();
 

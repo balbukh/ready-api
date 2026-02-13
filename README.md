@@ -40,7 +40,59 @@ A robust document processing API built with .NET 10.
 
 ## Testing
 
-Run the end-to-end test script:
 ```bash
-./test_e2e.sh
+dotnet test
 ```
+
+## Quick Demo
+
+Run the full invoice extraction pipeline end-to-end:
+
+**1. Start Postgres**
+```bash
+docker compose -f ops/docker-compose.yml up -d
+```
+
+**2. Start the API** (terminal 1)
+```bash
+dotnet run --project src/Ready.Api
+```
+
+**3. Start the Worker** (terminal 2)
+```bash
+dotnet run --project src/Ready.Worker
+```
+
+**4. Run the demo** (terminal 3)
+```bash
+# Uses defaults: http://localhost:5273 + demo-key-123
+./scripts/demo.sh path/to/invoice.pdf
+
+# Or with custom settings:
+READY_BASE_URL=http://localhost:5273 \
+READY_API_KEY=your-api-key \
+  ./scripts/demo.sh path/to/invoice.pdf
+```
+
+The script uploads the file, polls for the extraction result, and prints a summary:
+```
+  Invoice #:  INV-001
+  Date:       2025-01-15
+  Seller:     Acme Corp
+  Total:      544.50 EUR
+```
+
+**Diagnostics:** If extraction fails (invalid JSON or validation error), an error result is persisted:
+```bash
+curl "http://localhost:5273/results/{documentId}?type=InvoiceExtractError&version=v1" \
+  -H "X-Api-Key: demo-key-123"
+```
+
+**CSV Export:** Download the extracted invoice as a CSV file:
+```bash
+curl -JO "http://localhost:5273/download/{documentId}?type=InvoiceCsv&version=v1" \
+  -H "X-Api-Key: demo-key-123"
+```
+
+> **Requires**: `jq` (`brew install jq` on macOS)
+

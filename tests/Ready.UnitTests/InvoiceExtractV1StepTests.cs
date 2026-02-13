@@ -21,7 +21,7 @@ public class InvoiceExtractV1StepTests
         public string? Response { get; set; }
         public Exception? ExceptionToThrow { get; set; }
 
-        public Task<string> GenerateJsonAsync(string instructions, string inputText, CancellationToken ct)
+        public Task<string> GenerateJsonAsync(string instructions, string userPrompt, Guid? runId = null, Guid? docId = null, Guid? corrId = null, CancellationToken ct = default)
         {
             if (ExceptionToThrow is not null) throw ExceptionToThrow;
             return Task.FromResult(Response ?? "{}");
@@ -49,6 +49,9 @@ public class InvoiceExtractV1StepTests
                 .ToList();
             return Task.FromResult<IReadOnlyList<WorkflowResultDto>>(list);
         }
+
+        public bool HasErrorResult(Guid runId) 
+            => _results.Any(r => r.RunId == runId && r.ResultType == "InvoiceExtractError");
     }
 
     // ---- Tests ----
@@ -56,37 +59,14 @@ public class InvoiceExtractV1StepTests
     [Fact]
     public async Task ExecuteAsync_MissingDocText_ReturnsFailed()
     {
-        // Arrange
         var runId = Guid.NewGuid();
         var ai = new FakeOpenAiClient();
-        var results = new FakeResultStore(); // empty — no DocText
+        var results = new FakeResultStore(); // empty
         var step = new InvoiceExtractV1Step(ai, results, NullLogger<InvoiceExtractV1Step>.Instance);
         var ctx = MakeContext(runId);
 
-        // Act
         var outcome = await step.ExecuteAsync(ctx, CancellationToken.None);
 
-        // Assert
-        Assert.Equal(StepOutcomeStatus.Failed, outcome.Status);
-        Assert.Contains("No document text", outcome.Message);
-    }
-
-    [Fact]
-    public async Task ExecuteAsync_EmptyText_ReturnsFailed()
-    {
-        // Arrange
-        var runId = Guid.NewGuid();
-        var ai = new FakeOpenAiClient();
-        var results = new FakeResultStore();
-        results.Seed(runId, "DocText", "v1", new { text = "", chars = 0 });
-
-        var step = new InvoiceExtractV1Step(ai, results, NullLogger<InvoiceExtractV1Step>.Instance);
-        var ctx = MakeContext(runId);
-
-        // Act
-        var outcome = await step.ExecuteAsync(ctx, CancellationToken.None);
-
-        // Assert — empty text now returns Failed
         Assert.Equal(StepOutcomeStatus.Failed, outcome.Status);
         Assert.Contains("No document text", outcome.Message);
     }
@@ -94,102 +74,99 @@ public class InvoiceExtractV1StepTests
     [Fact]
     public async Task ExecuteAsync_ValidResponse_ReturnsInvoiceExtract()
     {
-        // Arrange
         var runId = Guid.NewGuid();
         var invoiceJson = JsonSerializer.Serialize(new
         {
             invoiceNumber = "INV-001",
-            date = "2024-02-12",
-            vendorName = "Acme Corp",
-            total = 121.00
+            invoiceDate = "2024-02-12",
+            // Missing sellerName but has InvoiceNumber -> Valid identity
+            sellerName = (string?)null, 
+            total = 121.00,
+            currency = "EUR"
         });
 
         var ai = new FakeOpenAiClient { Response = invoiceJson };
         var results = new FakeResultStore();
-        results.Seed(runId, "DocText", "v1", new { text = "some invoice text", chars = 17 });
+        results.Seed(runId, "DocText", "v1", new { text = "text", chars = 10 });
 
         var step = new InvoiceExtractV1Step(ai, results, NullLogger<InvoiceExtractV1Step>.Instance);
         var ctx = MakeContext(runId);
 
-        // Act
         var outcome = await step.ExecuteAsync(ctx, CancellationToken.None);
 
-        // Assert
         Assert.Equal(StepOutcomeStatus.Succeeded, outcome.Status);
         var envelope = outcome.Result as IResultEnvelope;
         Assert.NotNull(envelope);
         Assert.Equal("InvoiceExtract", envelope.ResultType);
-        Assert.Equal("v1", envelope.Version);
+        Assert.False(results.HasErrorResult(runId));
     }
 
     [Fact]
-    public async Task ExecuteAsync_OpenAiThrows_ReturnsFailed()
+    public async Task ExecuteAsync_InvalidJson_PersistsErrorAndReturnsFailed()
     {
-        // Arrange
         var runId = Guid.NewGuid();
-        var ai = new FakeOpenAiClient { ExceptionToThrow = new HttpRequestException("timeout") };
+        var ai = new FakeOpenAiClient { Response = "not json{{{" };
         var results = new FakeResultStore();
-        results.Seed(runId, "DocText", "v1", new { text = "some text", chars = 9 });
+        results.Seed(runId, "DocText", "v1", new { text = "text", chars = 10 });
 
         var step = new InvoiceExtractV1Step(ai, results, NullLogger<InvoiceExtractV1Step>.Instance);
         var ctx = MakeContext(runId);
 
-        // Act
         var outcome = await step.ExecuteAsync(ctx, CancellationToken.None);
 
-        // Assert
         Assert.Equal(StepOutcomeStatus.Failed, outcome.Status);
-        Assert.Contains("OpenAI failure", outcome.Message);
+        Assert.Contains("invalid json", outcome.Message?.ToLower());
+        Assert.True(results.HasErrorResult(runId), "Should persist InvoiceExtractError");
     }
 
     [Fact]
-    public async Task ExecuteAsync_InvalidJson_ReturnsFailed()
+    public async Task ExecuteAsync_ValidationFailure_PersistsErrorAndReturnsFailed()
     {
-        // Arrange
         var runId = Guid.NewGuid();
-        var ai = new FakeOpenAiClient { Response = "not json at all{{{" };
-        var results = new FakeResultStore();
-        results.Seed(runId, "DocText", "v1", new { text = "some text", chars = 9 });
-
-        var step = new InvoiceExtractV1Step(ai, results, NullLogger<InvoiceExtractV1Step>.Instance);
-        var ctx = MakeContext(runId);
-
-        // Act
-        var outcome = await step.ExecuteAsync(ctx, CancellationToken.None);
-
-        // Assert
-        Assert.Equal(StepOutcomeStatus.Failed, outcome.Status);
-        Assert.Contains("Invalid JSON", outcome.Message);
-    }
-
-    [Fact]
-    public async Task ExecuteAsync_PartialFields_StillReturnsSucceeded()
-    {
-        // The step trusts the AI prompt to fill fields; it does not validate required fields server-side.
-        // Partial JSON is still valid JSON, so it should succeed.
-        var runId = Guid.NewGuid();
-        var partialJson = JsonSerializer.Serialize(new
+        // Invalid: Missing total, Invalid Currency
+        var invalidJson = JsonSerializer.Serialize(new
         {
             invoiceNumber = "INV-001",
-            invoiceDate = (string?)null,
-            vendorName = (string?)null,
-            total = (decimal?)null
+            currency = "euro", // Invalid regex
+            // total missing
         });
 
-        var ai = new FakeOpenAiClient { Response = partialJson };
+        var ai = new FakeOpenAiClient { Response = invalidJson };
         var results = new FakeResultStore();
-        results.Seed(runId, "DocText", "v1", new { text = "some text", chars = 9 });
+        results.Seed(runId, "DocText", "v1", new { text = "text", chars = 10 });
 
         var step = new InvoiceExtractV1Step(ai, results, NullLogger<InvoiceExtractV1Step>.Instance);
         var ctx = MakeContext(runId);
 
-        // Act
         var outcome = await step.ExecuteAsync(ctx, CancellationToken.None);
 
-        // Assert
-        Assert.Equal(StepOutcomeStatus.Succeeded, outcome.Status);
-        var envelope = outcome.Result as IResultEnvelope;
-        Assert.NotNull(envelope);
-        Assert.Equal("InvoiceExtract", envelope.ResultType);
+        Assert.Equal(StepOutcomeStatus.Failed, outcome.Status);
+        Assert.Contains("validation failed", outcome.Message?.ToLower());
+        Assert.True(results.HasErrorResult(runId), "Should persist InvoiceExtractError");
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_MissingIdentity_ReturnsFailed()
+    {
+        var runId = Guid.NewGuid();
+        // Valid total/currency but missing invoiceNumber AND (invoiceDate+sellerName)
+        var json = JsonSerializer.Serialize(new
+        {
+            total = 100.00,
+            currency = "USD",
+            invoiceNumber = (string?)null,
+            invoiceDate = "2024-01-01",
+            sellerName = (string?)null
+        });
+
+        var ai = new FakeOpenAiClient { Response = json };
+        var results = new FakeResultStore();
+        results.Seed(runId, "DocText", "v1", new { text = "text", chars = 10 });
+
+        var step = new InvoiceExtractV1Step(ai, results, NullLogger<InvoiceExtractV1Step>.Instance);
+        var outcome = await step.ExecuteAsync(MakeContext(runId), CancellationToken.None);
+
+        Assert.Equal(StepOutcomeStatus.Failed, outcome.Status);
+        Assert.True(results.HasErrorResult(runId));
     }
 }

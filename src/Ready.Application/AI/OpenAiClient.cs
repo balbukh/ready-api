@@ -1,3 +1,4 @@
+using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -19,31 +20,90 @@ public sealed class OpenAiClient : IOpenAiClient
         _logger = logger;
     }
 
-    public async Task<string> GenerateJsonAsync(string instructions, string userPrompt, CancellationToken ct = default)
+    public async Task<string> GenerateJsonAsync(
+        string instructions,
+        string userPrompt,
+        Guid? runId = null,
+        Guid? documentId = null,
+        Guid? correlationId = null,
+        CancellationToken ct = default)
     {
-        // OpenAI Responses API format:
-        // - input: string (simple text) or array of message objects
-        // - instructions: system-level instructions
-        // - text.format: { type: "json_object" } for JSON mode
+        // Enforce hardened request fields
         var request = new
         {
             model = _options.Model,
             instructions,
             input = userPrompt,
-            text = new { format = new { type = "json_object" } }
+            text = new { format = new { type = "json_object" } },
+            max_output_tokens = 1000 // Reasonable cap
         };
 
-        var response = await _http.PostAsJsonAsync("https://api.openai.com/v1/responses", request, ct);
+        var delay = TimeSpan.FromSeconds(1);
+        const int maxAttempts = 3;
 
-        if (!response.IsSuccessStatusCode)
+        for (int attempt = 1; attempt <= maxAttempts; attempt++)
         {
-            var errorBody = await response.Content.ReadAsStringAsync(ct);
-            _logger.LogError("OpenAI API error {StatusCode}: {Body}", (int)response.StatusCode, errorBody);
-            response.EnsureSuccessStatusCode(); // throw
+            try
+            {
+                _logger.LogInformation(
+                    "OpenAI Attempt {Attempt}/{MaxAttempts} for Run {RunId} Doc {DocumentId} Corr {CorrelationId}",
+                    attempt, maxAttempts, runId, documentId, correlationId);
+
+                using var response = await _http.PostAsJsonAsync("https://api.openai.com/v1/responses", request, ct);
+
+                if (response.IsSuccessStatusCode)
+                {
+                    // Success! Extract and return.
+                    var json = await response.Content.ReadFromJsonAsync<JsonNode>(cancellationToken: ct);
+                    return ExtractContent(json);
+                }
+
+                // Handle Transient Failures (429, 5xx)
+                if (attempt < maxAttempts && IsTransient(response.StatusCode))
+                {
+                    var retryAfter = GetRetryAfter(response);
+                    var currentDelay = retryAfter ?? delay;
+
+                    // Cap at 10s if we got a huge Retry-After
+                    if (currentDelay.TotalSeconds > 10) currentDelay = TimeSpan.FromSeconds(10);
+
+                    // Add jitter (0-500ms)
+                    var jitter = TimeSpan.FromMilliseconds(Random.Shared.Next(0, 500));
+                    var waitTime = currentDelay + jitter;
+
+                    _logger.LogWarning(
+                        "OpenAI Transient Failure {StatusCode} on Attempt {Attempt}. Waiting {WaitTime}s before retry. Run {RunId}",
+                        response.StatusCode, attempt, waitTime.TotalSeconds, runId);
+
+                    await Task.Delay(waitTime, ct);
+
+                    // Exponential backoff for next time (unless we used Retry-After, but increasing baseline is safe)
+                    delay *= 2;
+                    continue;
+                }
+
+                // If not transient or retries exhausted, log error and throw
+                var errorBody = await response.Content.ReadAsStringAsync(ct);
+                _logger.LogError(
+                    "OpenAI API error {StatusCode} on Attempt {Attempt}: {Body}. Run {RunId}",
+                    (int)response.StatusCode, attempt, errorBody, runId);
+                
+                response.EnsureSuccessStatusCode(); // throw
+            }
+            catch (HttpRequestException ex) when (attempt < maxAttempts && (ex.StatusCode == null || IsTransient(ex.StatusCode.Value)))
+            {
+                 // Network errors are also transient
+                 _logger.LogWarning(ex, "OpenAI Network Error on Attempt {Attempt}. Retrying...", attempt);
+                 await Task.Delay(delay, ct);
+                 delay *= 2;
+            }
         }
 
-        var json = await response.Content.ReadFromJsonAsync<JsonNode>(cancellationToken: ct);
+        throw new InvalidOperationException("OpenAI retries exhausted");
+    }
 
+    private string ExtractContent(JsonNode? json)
+    {
         if (json is null) return string.Empty;
 
         // Responses API: output[] may contain reasoning + message entries.
@@ -64,8 +124,27 @@ public sealed class OpenAiClient : IOpenAiClient
         var content = json["choices"]?[0]?["message"]?["content"];
         if (content is not null) return content.ToString();
 
-        // Last resort: return the whole response
-        _logger.LogWarning("Could not extract content from OpenAI response, returning full body");
+        // Last resort
+        _logger.LogWarning("Could not extract content from OpenAI response");
         return json.ToJsonString();
+    }
+
+    private static bool IsTransient(HttpStatusCode code)
+    {
+        // 429 Too Many Requests
+        // 5xx Server Errors
+        return code == HttpStatusCode.TooManyRequests || 
+               (int)code >= 500;
+    }
+
+    private static TimeSpan? GetRetryAfter(HttpResponseMessage response)
+    {
+        var header = response.Headers.RetryAfter;
+        if (header is null) return null;
+
+        if (header.Delta.HasValue) return header.Delta.Value;
+        if (header.Date.HasValue) return header.Date.Value - DateTimeOffset.UtcNow;
+
+        return null;
     }
 }

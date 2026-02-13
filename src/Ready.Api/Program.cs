@@ -199,6 +199,80 @@ app.MapGet("/results/{documentId}", async (
     }
 }).RequireAuthorization();
 
+app.MapGet("/download/{documentId}", async (
+    Guid documentId,
+    string type,
+    string? version,
+    ClaimsPrincipal user,
+    ReadyDbContext db,
+    CancellationToken ct) =>
+{
+    var customerId = user.FindFirstValue(ClaimTypes.NameIdentifier);
+    if (string.IsNullOrEmpty(customerId)) return Results.Unauthorized();
+
+    // 1. Verify document exists and belongs to customer
+    var doc = await db.Documents
+        .Where(d => d.Id == documentId)
+        .Select(d => new { d.CustomerId })
+        .FirstOrDefaultAsync(ct);
+
+    if (doc is null || doc.CustomerId != customerId)
+        return Results.NotFound();
+
+    // 2. Find latest run
+    var latestRun = await db.Runs
+        .Where(r => r.DocumentId == documentId)
+        .OrderByDescending(r => r.StartedAt)
+        .FirstOrDefaultAsync(ct);
+
+    if (latestRun is null)
+        return Results.NotFound();
+
+    // 3. Find result
+    var query = db.Results
+        .Where(r => r.RunId == latestRun.Id)
+        .Where(r => r.ResultType.ToLower() == type.ToLower());
+
+    if (!string.IsNullOrEmpty(version))
+        query = query.Where(r => r.Version.ToLower() == version.ToLower());
+
+    var result = await query
+        .OrderByDescending(r => r.CreatedAt)
+        .FirstOrDefaultAsync(ct);
+
+    if (result is null)
+        return Results.NotFound();
+
+    // 4. Decode payload
+    try
+    {
+        var json = System.Text.Json.JsonDocument.Parse(result.PayloadJson);
+        if (json.RootElement.TryGetProperty("csvBase64", out var base64Prop))
+        {
+            var base64 = base64Prop.GetString();
+            if (!string.IsNullOrEmpty(base64))
+            {
+                var bytes = Convert.FromBase64String(base64);
+                var contentType = json.RootElement.TryGetProperty("contentType", out var ctProp) 
+                    ? ctProp.GetString() 
+                    : "application/octet-stream";
+                var fileName = json.RootElement.TryGetProperty("fileName", out var fnProp) 
+                    ? fnProp.GetString() 
+                    : $"download_{documentId}.bin";
+
+                return Results.File(bytes, contentType ?? "text/csv", fileName);
+            }
+        }
+        
+        // Fallback or error
+        return Results.Problem("Payload does not contain valid file data");
+    }
+    catch
+    {
+        return Results.Problem("Failed to parse result payload");
+    }
+}).RequireAuthorization();
+
 app.Run();
 
 public partial class Program { }
