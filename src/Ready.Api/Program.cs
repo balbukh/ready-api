@@ -8,7 +8,7 @@ using Microsoft.EntityFrameworkCore;
 
 var builder = WebApplication.CreateBuilder(args);
 
-builder.Services.AddReadyApplication();
+builder.Services.AddReadyApplication(builder.Configuration);
 
 var cs = builder.Configuration.GetConnectionString("ReadyDb")!;
 builder.Services.AddReadyInfrastructure(cs);

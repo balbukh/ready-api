@@ -8,7 +8,7 @@ var builder = Host.CreateApplicationBuilder(args);
 
 var cs = builder.Configuration.GetConnectionString("ReadyDb")!;
 
-builder.Services.AddReadyApplication();
+builder.Services.AddReadyApplication(builder.Configuration);
 builder.Services.AddReadyInfrastructure(cs);
 
 // optional: auto-migrate on startup (dev only)

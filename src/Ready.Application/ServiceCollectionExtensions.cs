@@ -1,14 +1,28 @@
 using Microsoft.Extensions.DependencyInjection;
 using Ready.Application.Results;
+using Ready.Application.AI;
+using Microsoft.Extensions.Configuration;
 using Ready.Application.Steps;
 using Ready.Application.Workflows;
+using MediatR; // Added for MediatR registration
+using Microsoft.Extensions.Options; // Added for IOptions usage
 
 namespace Ready.Application;
 
 public static class ServiceCollectionExtensions
 {
-    public static IServiceCollection AddReadyApplication(this IServiceCollection services)
+    public static IServiceCollection AddReadyApplication(this IServiceCollection services, IConfiguration configuration)
     {
+        services.AddMediatR(cfg => cfg.RegisterServicesFromAssembly(typeof(ServiceCollectionExtensions).Assembly));
+
+        // AI
+        services.Configure<OpenAiOptions>(configuration.GetSection(OpenAiOptions.SectionName));
+        services.AddHttpClient<IOpenAiClient, OpenAiClient>((sp, client) =>
+        {
+            var options = sp.GetRequiredService<IOptions<OpenAiOptions>>().Value;
+            client.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", options.ApiKey);
+        });
+
         // Workflows (поки in-memory)
         services.AddSingleton<IWorkflowRegistry>(_ =>
             new InMemoryWorkflowRegistry(new[]
@@ -16,7 +30,7 @@ public static class ServiceCollectionExtensions
                 new WorkflowDefinition(
                     Name: "invoice",
                     Version: "v1",
-                    Steps: new[] { "text.extract", "invoice.extract.v1", "invoice.validate.v1", "export.json" }
+                    Steps: new[] { "pdf.text.extract", "invoice.extract.v1" }
                 ),
                  // Fallback for "echo" test
                 new WorkflowDefinition("echo", "v1", new[] { "echo" })
@@ -24,8 +38,8 @@ public static class ServiceCollectionExtensions
 
         // Steps
         services.AddSingleton<Abstractions.IWorkflowStep, EchoStep>();
-        services.AddSingleton<Abstractions.IWorkflowStep, TextExtractStep>();
-        services.AddSingleton<Abstractions.IWorkflowStep, InvoiceExtractStep>();
+
+        services.AddScoped<Abstractions.IWorkflowStep, InvoiceExtractV1Step>();
         services.AddSingleton<Abstractions.IWorkflowStep, InvoiceValidateStep>();
         services.AddSingleton<Abstractions.IWorkflowStep, ExportJsonStep>();
 
