@@ -3,6 +3,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Ready.Application.Abstractions;
 using Ready.Application.Results;
 using Ready.Infrastructure.Persistence;
+using Ready.Infrastructure.Steps;
 
 namespace Ready.Infrastructure;
 
@@ -19,6 +20,8 @@ public static class ServiceCollectionExtensions
 
         services.AddSingleton<IFileStorage>(_ =>
             new Storage.LocalFileStorage(Path.Combine(AppContext.BaseDirectory, "data")));
+
+        services.AddScoped<IWorkflowStep, PdfTextExtractStep>();
 
         return services;
     }
