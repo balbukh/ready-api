@@ -134,6 +134,71 @@ app.MapGet("/documents/{id}", async (
     ));
 }).RequireAuthorization();
 
+app.MapGet("/results/{documentId}", async (
+    Guid documentId,
+    string type,
+    string? version,
+    ClaimsPrincipal user,
+    ReadyDbContext db,
+    CancellationToken ct) =>
+{
+    var customerId = user.FindFirstValue(ClaimTypes.NameIdentifier);
+    if (string.IsNullOrEmpty(customerId)) return Results.Unauthorized();
+
+    // 1. Verify document exists and belongs to customer
+    var doc = await db.Documents
+        .Where(d => d.Id == documentId)
+        .Select(d => new { d.CustomerId })
+        .FirstOrDefaultAsync(ct);
+
+    if (doc is null || doc.CustomerId != customerId)
+        return Results.NotFound(new { message = "Result not found" });
+
+    // 2. Find latest run for this document
+    var latestRun = await db.Runs
+        .Where(r => r.DocumentId == documentId)
+        .OrderByDescending(r => r.StartedAt)
+        .FirstOrDefaultAsync(ct);
+
+    if (latestRun is null)
+        return Results.NotFound(new { message = "Result not found" });
+
+    // 3. Find matching result in that run
+    var query = db.Results
+        .Where(r => r.RunId == latestRun.Id)
+        .Where(r => r.ResultType.ToLower() == type.ToLower());
+
+    if (!string.IsNullOrEmpty(version))
+        query = query.Where(r => r.Version.ToLower() == version.ToLower());
+
+    var result = await query
+        .OrderByDescending(r => r.CreatedAt)
+        .FirstOrDefaultAsync(ct);
+
+    if (result is null)
+        return Results.NotFound(new { message = "Result not found" });
+
+    // 4. Parse payload JSON into object
+    try
+    {
+        var payload = System.Text.Json.JsonSerializer.Deserialize<System.Text.Json.JsonElement>(result.PayloadJson);
+        return Results.Ok(new
+        {
+            documentId,
+            resultType = result.ResultType,
+            version = result.Version,
+            createdAt = result.CreatedAt,
+            payload
+        });
+    }
+    catch (System.Text.Json.JsonException)
+    {
+        return Results.Problem(
+            detail: "Stored payload is not valid JSON",
+            statusCode: 500);
+    }
+}).RequireAuthorization();
+
 app.Run();
 
 public partial class Program { }
